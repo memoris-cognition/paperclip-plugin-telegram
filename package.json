@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "dev": "tsc --watch",
     "test": "vitest run",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
