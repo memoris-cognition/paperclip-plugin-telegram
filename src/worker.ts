@@ -59,6 +59,13 @@ import { isWorking } from "./agent-status.js";
 import { buildPaperclipAuthHeaders, fetchPaperclipApi } from "./paperclip-api.js";
 import { str } from "./coerce.js";
 import { resolveTelegramBotToken, type TelegramRuntimeHealth } from "./runtime-token.js";
+import { makeUpdateDedupe } from "./update-dedupe.js";
+import {
+  getPendingInteractions,
+  notifyPendingInteractions,
+  formatPendingInteractionGuardReply,
+  type InteractionIssueRef,
+} from "./interactions.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
@@ -78,6 +85,7 @@ type TelegramConfig = {
   onlyNotifyIfAssignedTo: string;
   notifyOnApprovalCreated: boolean;
   onlyNotifyBoardApprovals: boolean;
+  notifyOnInteractionPending: boolean;
   notifyOnAgentError: boolean;
   notifyOnAgentRunStarted: boolean;
   notifyOnAgentRunFinished: boolean;
@@ -217,6 +225,7 @@ const escalationManager = new EscalationManager();
 const issuePrefixCache = new Map<string, string>();
 const doneDedupe = makeUpdateDedupe();
 const assignmentDedupe = makeUpdateDedupe();
+const interactionCheckDedupe = makeUpdateDedupe();
 const agentErrorDedupe = makeUpdateDedupe(AGENT_ERROR_DEDUPLICATION_WINDOW_MS, 1000);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -324,31 +333,6 @@ async function resolveCallbackCompanyId(
   }) as { companyId?: string } | null;
 
   return mapping?.companyId ?? null;
-}
-
-/**
- * Shared 5s sliding-window dedupe for issue.updated handlers.
- *
- * Paperclip's core can emit duplicate `issue.updated` plugin events for a
- * single PATCH (the route's logActivity plus side-effects from heartbeat
- * reconciliation), so handlers must dedupe to avoid sending the same
- * Telegram message twice.
- */
-function makeUpdateDedupe(windowMs = 5_000, maxEntries = 500) {
-  const seen = new Map<string, number>();
-  return (key: string): boolean => {
-    const now = Date.now();
-    const last = seen.get(key);
-    if (last !== undefined && now - last < windowMs) return false;
-    seen.set(key, now);
-    if (seen.size > maxEntries) {
-      const cutoff = now - windowMs;
-      for (const [k, ts] of seen) {
-        if (ts < cutoff) seen.delete(k);
-      }
-    }
-    return true;
-  };
 }
 
 function normalizeAgentErrorMessage(input: unknown): string {
@@ -803,6 +787,24 @@ async function notify(
   }
 }
 
+/**
+ * Discover and notify the pending interaction cards of one issue. Shared by
+ * the `issue.updated` → `in_review` handler and the periodic sweep job; all
+ * dedupe (in-memory burst + durable per-interaction state) happens inside
+ * `notifyPendingInteractions`.
+ */
+async function notifyIssuePendingInteractions(
+  ctx: PluginContext,
+  rt: TelegramRuntime,
+  issue: InteractionIssueRef,
+  companyId: string,
+): Promise<number> {
+  const chatId = await resolveChat(ctx, companyId, rt.config.defaultChatId);
+  if (!chatId) return 0;
+  const linksOpts = await resolveIssueLinksOpts(ctx, rt.publicUrl, companyId);
+  return notifyPendingInteractions(ctx, rt.token, issue, companyId, chatId, linksOpts);
+}
+
 const enrichAgentName = async (ctx: PluginContext, event: PluginEvent) => {
   const payload = event.payload as Record<string, unknown>;
   if (payload.agentId && !payload.agentName) {
@@ -927,6 +929,32 @@ export const plugin = definePlugin({
       }
 
       await notify(ctx, rt, event, formatIssueAssigned);
+    });
+
+    // Pending interaction cards. The host emits no `interaction.*` event, so
+    // the `in_review` transition (the platform convention accompanying every
+    // card) is the creation signal; the sweep job below is the safety net.
+    ctx.events.on("issue.updated", async (event: PluginEvent) => {
+      const rt = ensureRuntime();
+      if (!rt || !rt.config.notifyOnInteractionPending) return;
+      const payload = event.payload as Record<string, unknown>;
+      if (payload.status !== "in_review" || !event.entityId) return;
+      if (!interactionCheckDedupe(`interactions|${event.entityId}`)) return;
+      try {
+        const issue = await ctx.issues.get(event.entityId, event.companyId);
+        if (!issue) return;
+        await notifyIssuePendingInteractions(
+          ctx,
+          rt,
+          { id: issue.id, identifier: issue.identifier ?? null, title: issue.title ?? null },
+          event.companyId,
+        );
+      } catch (err) {
+        ctx.logger.warn("Pending interaction notification failed", {
+          issueId: event.entityId,
+          error: String(err),
+        });
+      }
     });
 
     ctx.events.on("approval.created", async (event: PluginEvent) => {
@@ -1364,6 +1392,37 @@ export const plugin = definePlugin({
       }
     });
 
+    // --- Pending interaction sweep job (safety net for missed events) ---
+    ctx.jobs.register("check-pending-interactions", async () => {
+      const rt = ensureRuntime();
+      if (!rt || !rt.config.notifyOnInteractionPending) return;
+      let companies;
+      try {
+        companies = await ctx.companies.list();
+      } catch (err) {
+        ctx.logger.warn("Pending interaction sweep could not list companies", { error: String(err) });
+        return;
+      }
+      for (const company of companies) {
+        try {
+          const issues = await ctx.issues.list({ companyId: company.id, status: "in_review", limit: 50 });
+          for (const issue of issues) {
+            await notifyIssuePendingInteractions(
+              ctx,
+              rt,
+              { id: issue.id, identifier: issue.identifier ?? null, title: issue.title ?? null },
+              company.id,
+            );
+          }
+        } catch (err) {
+          ctx.logger.warn("Pending interaction sweep failed for company", {
+            companyId: company.id,
+            error: String(err),
+          });
+        }
+      }
+    });
+
     // --- Phase 5: Watch checker job ---
     ctx.jobs.register("check-watches", async () => {
       const rt = ensureRuntime();
@@ -1555,6 +1614,34 @@ export async function handleUpdate(
         from: msg.from?.username,
       });
     } else if (mapping && mapping.entityType === "issue") {
+      // Guard: a plain-text reply must not become a comment while the issue
+      // has a pending interaction card — a user comment can supersede the
+      // card, and the text never carries the structured decision. Point the
+      // responder at the card instead. getPendingInteractions returns [] on
+      // hosts without `issue.interactions.read`, preserving old behavior.
+      const pending = await getPendingInteractions(ctx, mapping.entityId, mapping.companyId);
+      if (pending.length > 0) {
+        let issueRef: InteractionIssueRef = { id: mapping.entityId, identifier: null, title: null };
+        let linksOpts: IssueLinksOpts | undefined;
+        try {
+          const issue = await ctx.issues.get(mapping.entityId, mapping.companyId);
+          if (issue) {
+            issueRef = { id: issue.id, identifier: issue.identifier ?? null, title: issue.title ?? null };
+          }
+          if (publicUrl) {
+            linksOpts = await resolveIssueLinksOpts(ctx, publicUrl, mapping.companyId);
+          }
+        } catch { /* best effort — the guard reply degrades to a link-less text */ }
+        const guard = formatPendingInteractionGuardReply(issueRef, pending, linksOpts);
+        guard.options.replyToMessageId = msg.message_id;
+        if (threadId) guard.options.messageThreadId = threadId;
+        await sendMessage(ctx, token, chatId, guard.text, guard.options);
+        ctx.logger.info("Blocked Telegram reply from commenting on issue with pending interaction", {
+          issueId: mapping.entityId,
+          pendingInteractionIds: pending.map((p) => p.id),
+        });
+        return;
+      }
       try {
         // Use the SDK (not ctx.http.fetch) because the plugin sandbox blocks
         // outbound fetches to private IPs like 127.0.0.1 for SSRF protection.

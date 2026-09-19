@@ -1,6 +1,6 @@
 {
   "name": "paperclip-plugin-telegram",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "type": "module",
   "main": "./dist/index.js",
   "paperclipPlugin": {
@@ -21,8 +21,8 @@
     "react-dom": ">=18"
   },
   "devDependencies": {
-    "@paperclipai/plugin-sdk": "^2026.722.0",
-    "@paperclipai/shared": "^2026.722.0",
+    "@paperclipai/plugin-sdk": "^2026.916.0",
+    "@paperclipai/shared": "^2026.916.0",
     "typescript": "^5.7.0",
     "vitest": "^3.2.6",
     "@types/node": "^22.0.0",

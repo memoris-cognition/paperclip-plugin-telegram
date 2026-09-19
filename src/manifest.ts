@@ -18,6 +18,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.update",
     "issue.comments.read",
     "issue.comments.create",
+    "issue.interactions.read",
     "agents.read",
     "agents.invoke",
     "agent.sessions.create",
@@ -90,6 +91,12 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Check Escalation Timeouts",
       description: "Check for timed-out escalations and apply default actions.",
       schedule: "* * * * *",
+    },
+    {
+      jobKey: "check-pending-interactions",
+      displayName: "Check Pending Interactions",
+      description: "Sweep in-review issues for pending interaction cards and notify Telegram (safety net for missed events).",
+      schedule: "*/10 * * * *",
     },
     {
       jobKey: "check-watches",

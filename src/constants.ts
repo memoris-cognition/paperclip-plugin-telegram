@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-telegram";
-export const PLUGIN_VERSION = "0.8.1";
+export const PLUGIN_VERSION = "0.9.0";
 export const MAX_AGENTS_PER_THREAD = 5;
 
 export const DEFAULT_CONFIG = {
@@ -20,6 +20,7 @@ export const DEFAULT_CONFIG = {
   onlyNotifyIfAssignedTo: "",
   notifyOnApprovalCreated: true,
   onlyNotifyBoardApprovals: false,
+  notifyOnInteractionPending: true,
   notifyOnAgentError: true,
   notifyOnAgentRunStarted: false,
   notifyOnAgentRunFinished: false,
