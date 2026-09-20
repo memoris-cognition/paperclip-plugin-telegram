@@ -36,6 +36,20 @@ This is that plugin.
 - Clicking a button calls the Paperclip API and updates the Telegram message inline
 - Callback query acknowledgment with result text
 
+### Interactive decision cards (issue-thread interactions)
+Pending decision cards on an issue are notified to Telegram and rendered interactively:
+
+- `request_confirmation` - Approve / Request changes buttons; the rejection reason is collected via a ForceReply prompt and submitted as the card's structured `reason`, never as an issue comment
+- `ask_user_questions` - one question at a time; options as inline buttons, free text via ForceReply; all answers are submitted in a single final `respond` call
+- `request_item_verdicts` - one approve/reject/defer button row per item; each click is a partial verdict submission; reject reasons via ForceReply
+- `request_checkbox_confirmation` and `suggest_tasks` - toggle buttons (the message is edited on every click) plus a confirm-selection button
+- every card keeps a deep link to the web app; long option/item lists are truncated under Telegram's keyboard limit with a pointer to the web card
+- buttons are only accepted from chats on the existing allowlist
+
+Resolution is attributed to a **paired board user**, never to the plugin itself: plain accept/reject goes through the SDK's `respondInteraction` (capability `issue.interactions.respond`) with the board-access identity, and structured bodies (selections, answers, verdicts) go through the board REST routes with the board-access API token. Without board pairing, buttons answer with a pointer to the web card - so `human_only` cards are never resolvable from an unpaired chat.
+
+A plain-text reply to an issue message while a decision card is pending is blocked (it would not carry the structured decision); the bot replies with a link to the card instead.
+
 ### Per-type chat routing
 - `approvalsChatId` - Dedicated chat for approval notifications
 - `approvalsTopicId` - Dedicated forum topic for approval notifications

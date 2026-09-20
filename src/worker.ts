@@ -66,6 +66,14 @@ import {
   formatPendingInteractionGuardReply,
   type InteractionIssueRef,
 } from "./interactions.js";
+import { isInteractionCallback } from "./interaction-render.js";
+import {
+  handleInteractionCallback,
+  handleInteractionPromptReply,
+  interactionCallbackCompanyId,
+  isInteractionPromptMapping,
+  type InteractionDeps,
+} from "./interaction-callbacks.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
@@ -317,6 +325,30 @@ async function resolveBoardApiToken(
   }
 
   return undefined;
+}
+
+/**
+ * Dependencies for the interactive interaction-card handlers: the board-access
+ * pairing (user id + API token) scoped to the flow's company. Without pairing
+ * both fields stay undefined and the handlers answer with a web pointer.
+ */
+async function buildInteractionDeps(
+  ctx: PluginContext,
+  config: TelegramConfig,
+  telegramToken: string,
+  apiBaseUrl: string,
+  companyId: string | null,
+): Promise<InteractionDeps> {
+  const boardAccess = await loadBoardAccessState(ctx);
+  const identityMatchesCompany =
+    !companyId || !boardAccess.companyId || boardAccess.companyId === companyId;
+  return {
+    ctx,
+    telegramToken,
+    apiBaseUrl,
+    boardApiToken: await resolveBoardApiToken(ctx, config, companyId),
+    boardUserId: identityMatchesCompany ? boardAccess.identity ?? undefined : undefined,
+  };
 }
 
 async function resolveCallbackCompanyId(
@@ -1520,6 +1552,14 @@ export async function handleUpdate(
   }
 
   if (update.callback_query) {
+    const data = update.callback_query.data ?? "";
+    // Interactive interaction cards (M1): flow state carries the company id.
+    if (isInteractionCallback(data)) {
+      const companyId = await interactionCallbackCompanyId(ctx, data);
+      const deps = await buildInteractionDeps(ctx, config, token, baseUrl, companyId);
+      await handleInteractionCallback(deps, update.callback_query);
+      return;
+    }
     const companyId = await resolveCallbackCompanyId(ctx, update.callback_query);
     const boardApiToken = await resolveBoardApiToken(ctx, config, companyId);
     await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken);
@@ -1552,6 +1592,22 @@ export async function handleUpdate(
   if (!msg.text) return;
 
   const text = msg.text;
+
+  // ForceReply prompts for interactive cards (reject reasons, free-text
+  // answers) belong to the card flow, not to the generic inbound routing:
+  // they take precedence over agent-session threads and work even when
+  // enableInbound is off.
+  if (msg.reply_to_message?.from?.is_bot) {
+    const promptMapping = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `msg_${chatId}_${msg.reply_to_message.message_id}`,
+    });
+    if (isInteractionPromptMapping(promptMapping)) {
+      const deps = await buildInteractionDeps(ctx, config, token, baseUrl, promptMapping.companyId);
+      await handleInteractionPromptReply(deps, promptMapping, msg.reply_to_message.message_id, msg);
+      return;
+    }
+  }
 
   // Route thread messages to agent sessions
   if (threadId) {

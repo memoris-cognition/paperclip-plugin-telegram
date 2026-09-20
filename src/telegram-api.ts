@@ -17,6 +17,8 @@ export type SendMessageOptions = {
   messageThreadId?: number;
   inlineKeyboard?: InlineKeyboard;
   disableNotification?: boolean;
+  /** Ask Telegram to open a reply prompt on the sent message (mutually exclusive with inlineKeyboard). */
+  forceReply?: boolean;
 };
 
 export async function sendMessage(
@@ -40,6 +42,8 @@ export async function sendMessage(
     body.reply_markup = {
       inline_keyboard: options.inlineKeyboard,
     };
+  } else if (options.forceReply) {
+    body.reply_markup = { force_reply: true };
   }
 
   for (let attempt = 0; attempt < 3; attempt++) {

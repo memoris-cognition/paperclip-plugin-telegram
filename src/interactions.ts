@@ -1,9 +1,20 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import type { IssueThreadInteraction } from "@paperclipai/shared";
+import type {
+  IssueThreadInteraction,
+  RequestCheckboxConfirmationPayload,
+  SuggestTasksPayload,
+} from "@paperclipai/shared";
 import { sendMessage, escapeMarkdownV2 } from "./telegram-api.js";
 import type { SendMessageOptions } from "./telegram-api.js";
 import type { IssueLinksOpts } from "./formatters.js";
 import { str } from "./coerce.js";
+import {
+  INTERACTIVE_KINDS,
+  newFlowToken,
+  renderCard,
+  type InteractionFlowState,
+} from "./interaction-render.js";
+import { saveFlowState } from "./interaction-callbacks.js";
 
 // ---------------------------------------------------------------------------
 // Pending interaction cards (decision cards)
@@ -165,6 +176,44 @@ export function formatPendingInteractionGuardReply(
   };
 }
 
+/**
+ * Initial callback flow state for one interactive card. Selections start from
+ * the payload defaults: the checkbox pre-checked ids, every visible suggested
+ * task (accept-all is the common case), nothing anywhere else.
+ */
+function buildFlowState(
+  interaction: IssueThreadInteraction,
+  issue: InteractionIssueRef,
+  chatId: string,
+  opts?: IssueLinksOpts,
+  messageThreadId?: number,
+): InteractionFlowState {
+  const url = interactionUrl(opts, issue.identifier, interaction.id);
+  let selections: string[] | undefined;
+  if (interaction.kind === "request_checkbox_confirmation") {
+    selections = (interaction.payload as RequestCheckboxConfirmationPayload).defaultSelectedOptionIds ?? [];
+  } else if (interaction.kind === "suggest_tasks") {
+    selections = (interaction.payload as SuggestTasksPayload).tasks
+      .filter((t) => !t.hiddenInPreview)
+      .map((t) => t.clientKey);
+  }
+  return {
+    token: newFlowToken(),
+    companyId: interaction.companyId,
+    issueId: issue.id,
+    interactionId: interaction.id,
+    kind: interaction.kind,
+    chatId,
+    messageThreadId,
+    webUrl: url ?? undefined,
+    issueIdentifier: issue.identifier ?? undefined,
+    title: str(interaction.title, str(issue.title, "")) || undefined,
+    payload: interaction.payload,
+    ...(selections ? { selections } : {}),
+    ...(interaction.kind === "ask_user_questions" ? { questionIndex: 0, answers: [] } : {}),
+  };
+}
+
 function notifiedStateScope(interactionId: string) {
   return {
     scopeKind: "instance",
@@ -210,11 +259,41 @@ export async function notifyPendingInteractions(
     if (already) continue;
 
     const requesterName = await resolveRequesterName(ctx, interaction, companyId);
-    const msg = formatPendingInteraction(interaction, issue, requesterName, opts);
+
+    // Interactive rendering (M1): the 5 renderable kinds get inline buttons
+    // wired to callback flow state. Anything else — or a rendering failure —
+    // degrades to the M0 link-only notification.
+    let msg: { text: string; options: SendMessageOptions };
+    let flowState: InteractionFlowState | null = null;
+    if (INTERACTIVE_KINDS.has(interaction.kind) && interaction.payload) {
+      try {
+        flowState = buildFlowState(interaction, issue, chatId, opts, messageThreadId);
+        const card = renderCard(flowState);
+        msg = {
+          text: card.text,
+          options: { parseMode: "MarkdownV2", inlineKeyboard: card.keyboard },
+        };
+      } catch (err) {
+        ctx.logger.warn("Interactive card rendering failed, falling back to link-only", {
+          interactionId: interaction.id,
+          kind: interaction.kind,
+          error: String(err),
+        });
+        flowState = null;
+        msg = formatPendingInteraction(interaction, issue, requesterName, opts);
+      }
+    } else {
+      msg = formatPendingInteraction(interaction, issue, requesterName, opts);
+    }
     if (messageThreadId) msg.options.messageThreadId = messageThreadId;
 
     const messageId = await sendMessage(ctx, token, chatId, msg.text, msg.options);
     if (messageId === null) continue;
+
+    if (flowState) {
+      flowState.messageId = messageId;
+      await saveFlowState(ctx, flowState);
+    }
 
     // Mark notified first: a duplicate notification is the failure mode this
     // state exists to prevent, and it is worse than a lost one (the sweep
