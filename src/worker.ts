@@ -1141,8 +1141,12 @@ export const plugin = definePlugin({
       }
       if (!shouldSend) return;
 
-      const companies = await ctx.companies.list();
-      for (const company of companies) {
+      // Jobs run outside a host invocation, so an unscoped companies.list()
+      // races with live invocations and gets denied (invocation scope gate,
+      // Paperclip ≥ 2026.1023). Read the runtime's own company explicitly.
+      const scopedCompany = await ctx.companies.get(rt.companyId);
+      if (!scopedCompany) return;
+      for (const company of [scopedCompany]) {
         const chatId = await resolveChat(ctx, company.id, rt.config.digestChatId || rt.config.defaultChatId);
         if (!chatId) continue;
 
@@ -1428,27 +1432,24 @@ export const plugin = definePlugin({
     ctx.jobs.register("check-pending-interactions", async () => {
       const rt = ensureRuntime();
       if (!rt || !rt.config.notifyOnInteractionPending) return;
-      let companies;
-      try {
-        companies = await ctx.companies.list();
-      } catch (err) {
-        ctx.logger.warn("Pending interaction sweep could not list companies", { error: String(err) });
-        return;
-      }
-      for (const company of companies) {
+      // Jobs run outside a host invocation, so an unscoped companies.list()
+      // races with live invocations and gets denied (invocation scope gate,
+      // Paperclip ≥ 2026.1023). This worker is single-tenant: sweep the
+      // runtime's own company explicitly.
+      for (const companyId of [rt.companyId]) {
         try {
-          const issues = await ctx.issues.list({ companyId: company.id, status: "in_review", limit: 50 });
+          const issues = await ctx.issues.list({ companyId, status: "in_review", limit: 50 });
           for (const issue of issues) {
             await notifyIssuePendingInteractions(
               ctx,
               rt,
               { id: issue.id, identifier: issue.identifier ?? null, title: issue.title ?? null },
-              company.id,
+              companyId,
             );
           }
         } catch (err) {
           ctx.logger.warn("Pending interaction sweep failed for company", {
-            companyId: company.id,
+            companyId,
             error: String(err),
           });
         }
@@ -1460,10 +1461,12 @@ export const plugin = definePlugin({
       const rt = ensureRuntime();
       if (!rt) return;
       try {
+        // Scoped to the runtime's company: an unscoped companies.list() from a
+        // job is denied by the invocation scope gate (Paperclip ≥ 2026.1023).
         await checkWatches(ctx, rt.token, {
           maxSuggestionsPerHourPerCompany: rt.config.maxSuggestionsPerHourPerCompany ?? 10,
           watchDeduplicationWindowMs: rt.config.watchDeduplicationWindowMs ?? 86400000,
-        });
+        }, rt.companyId);
       } catch (err) {
         ctx.logger.error("Watch check failed", { error: String(err) });
       }
